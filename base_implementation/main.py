@@ -12,6 +12,7 @@ Dependencies:
 """
 
 import hashlib
+import os
 import struct
 import time
 from typing import Generator
@@ -26,6 +27,11 @@ DURATION       = 10              # seconds  (10–30)
 GRAIN_SIZE     = 1024            # samples per grain  (try 2048 too)
 LSB_BITS       = 2               # how many LSBs to extract per sample (1 or 2)
 CHANNELS       = 1               # mono
+
+# Security Settings
+WARMUP_SECONDS   = 1             # seconds to discard from start of recording
+VAR_THRESHOLD    = 0.5           # min variance per grain to accept as entropy
+MIN_UNIQUE_RATIO = 0.1           # min unique samples ratio per grain
 
 
 # ─────────────────────────────────────────────
@@ -43,17 +49,20 @@ def record_audio(duration: int = DURATION,
     except ImportError:
         raise ImportError("Install sounddevice:  pip install sounddevice")
 
-    print(f"[*] Recording {duration}s of audio at {sample_rate} Hz …")
+    print(f"[*] Recording {duration}s (+{WARMUP_SECONDS}s warmup) @ {sample_rate} Hz …")
     raw = sd.rec(
-        frames=duration * sample_rate,
+        frames=(duration + WARMUP_SECONDS) * sample_rate,
         samplerate=sample_rate,
         channels=CHANNELS,
         dtype="int16",
         blocking=True,
     )
     sd.wait()
-    samples = raw.flatten()          # shape: (N,)  dtype: int16
-    print(f"[+] Captured {len(samples):,} samples.")
+    all_samples = raw.flatten()
+    # Trim warmup
+    trim_idx = WARMUP_SECONDS * sample_rate
+    samples = all_samples[trim_idx:]
+    print(f"[+] Captured {len(samples):,} samples (discarded {trim_idx:,} warmup samples).")
     return samples
 
 
@@ -168,6 +177,39 @@ def hash_grain(grain: np.ndarray) -> bytes:
 
 
 # ─────────────────────────────────────────────
+# STEP 4C — AUXILIARY ENTROPY SOURCES
+# ─────────────────────────────────────────────
+
+def get_jitter_entropy(n_bytes: int = 16) -> bytes:
+    """
+    Measure CPU execution jitter.
+    Times a small busy-loop many times and collects high-precision 
+    timing deltas.
+    """
+    entropy = bytearray()
+    for _ in range(n_bytes):
+        # Time how long it takes to increment a counter 1000 times
+        t1 = time.perf_counter_ns()
+        x = 0
+        for i in range(1000):
+            x += i
+        t2 = time.perf_counter_ns()
+        # Take the LSB of the nanosecond delta
+        entropy.append((t2 - t1) & 0xFF)
+    return bytes(entropy)
+
+
+def get_system_entropy() -> bytes:
+    """Gather high-resolution system state (timing, PID, etc)."""
+    state = [
+        time.perf_counter_ns().to_bytes(8, "big"),
+        time.process_time_ns().to_bytes(8, "big"),
+        struct.pack("I", os.getpid()),
+    ]
+    return hashlib.sha256(b"".join(state)).digest()
+
+
+# ─────────────────────────────────────────────
 # ENTROPY QUALITY METRICS
 # ─────────────────────────────────────────────
 
@@ -240,20 +282,41 @@ def run_pipeline(source: str = "mic",
     lsb_pool:      bytearray = bytearray()
     hash_pool:     bytearray = bytearray()
     grain_entropies: list[float] = []
+    
+    rejected_variance = 0
+    rejected_unique   = 0
 
     print(f"\n[Step 3+4] Processing grains …")
     for grain in make_grains(samples, grain_size):
+        # ── Health Test 1: Variance ─────────────
+        var = np.var(grain)
+        if var < VAR_THRESHOLD:
+            rejected_variance += 1
+            continue
+            
+        # ── Health Test 2: Repetition / Uniqueness
+        unique_ratio = len(np.unique(grain)) / len(grain)
+        if unique_ratio < MIN_UNIQUE_RATIO:
+            rejected_unique += 1
+            continue
+
         # Stats per grain (on raw PCM)
         g_bytes = grain.astype("<i2").tobytes()
         grain_entropies.append(shannon_entropy(g_bytes))
 
-        # Option A — LSB
+        # Entropy Sources
         lsb_str   = extract_lsb(grain, lsb_bits)
         lsb_bytes = lsb_bits_to_bytes(lsb_str)
-        lsb_pool.extend(lsb_bytes)
+        
+        jitter_bytes = get_jitter_entropy(16)
+        system_bytes = get_system_entropy()
 
-        # Option B — Hash / Whitening
-        h = hash_grain(grain)
+        # Mixing (Option B - Whitening)
+        # We mix audio bytes, jitter, and system state before hashing
+        combined_source = lsb_bytes + jitter_bytes + system_bytes
+        h = hashlib.sha256(combined_source).digest()
+        
+        lsb_pool.extend(lsb_bytes)
         hash_pool.extend(h)
 
     # ── Comparison & Metrics ──────────────────
@@ -266,7 +329,9 @@ def run_pipeline(source: str = "mic",
     g_std  = float(np.std(grain_entropies))  if grain_entropies else 0.0
 
     print(f"\n{'─'*60}")
-    print(f"{'METRIC':<20} | {'RAW PCM':<10} | {'LSB EXT':<10} | {'HASHED':<10}")
+    print(f"Health Tests: {rejected_variance} low-variance grains rejected, {rejected_unique} low-uniqueness grains rejected.")
+    print(f"{'─'*60}")
+    print(f"{'METRIC':<20} | {'RAW PCM':<10} | {'LSB EXT':<10} | {'MIXED/HASH':<10}")
     print(f"{'─'*60}")
     
     def print_metric(name, raw, lsb, hashed, fmt=".4f"):
