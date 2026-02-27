@@ -1,5 +1,5 @@
 # natrng
-`natrng`, or Natural Random Number Generator, is a codebase for an academic paper titled "*Perancangan dan analisis penghasil angka acak berbasis suara lingkungan sekitar sebagai sumber entropi fisik.*".
+`natrng`, or Natural Random Number Generator, is a codebase for an academic paper titled "***Perancangan dan Analisis Penghasil Angka Acak Berbasis Suara Lingkungan Sekitar Sebagai Sumber Entropi Fisik***".
 
 For now, the codebase is a work in progress. The current codebase is just a simple base implementtion made in Python, but the goal is to create a more robust and efficient implementation in Rust.
 

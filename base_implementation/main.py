@@ -191,6 +191,19 @@ def bit_balance(data: bytes) -> float:
     return float(bits.mean())
 
 
+def min_entropy(data: bytes) -> float:
+    """
+    Calculate min-entropy in bits per byte.
+    H_min = -log2(max_probability)
+    Perfect randomness → 8.0 bits/byte.
+    """
+    if not data:
+        return 0.0
+    counts = np.bincount(np.frombuffer(data, dtype=np.uint8), minlength=256)
+    max_p = np.max(counts) / len(data)
+    return float(-np.log2(max_p))
+
+
 # ─────────────────────────────────────────────
 # PIPELINE RUNNER
 # ─────────────────────────────────────────────
@@ -224,11 +237,15 @@ def run_pipeline(source: str = "mic",
         print(f"  sample {i:02d}: {chunk}")
 
     # ── Step 3 + 4: Grain → Entropy ──────────
-    lsb_pool:  bytearray = bytearray()
-    hash_pool: bytearray = bytearray()
+    lsb_pool:      bytearray = bytearray()
+    hash_pool:     bytearray = bytearray()
+    grain_entropies: list[float] = []
 
     print(f"\n[Step 3+4] Processing grains …")
     for grain in make_grains(samples, grain_size):
+        # Stats per grain (on raw PCM)
+        g_bytes = grain.astype("<i2").tobytes()
+        grain_entropies.append(shannon_entropy(g_bytes))
 
         # Option A — LSB
         lsb_str   = extract_lsb(grain, lsb_bits)
@@ -239,21 +256,42 @@ def run_pipeline(source: str = "mic",
         h = hash_grain(grain)
         hash_pool.extend(h)
 
-    # ── Metrics ──────────────────────────────
+    # ── Comparison & Metrics ──────────────────
+    raw_bytes_out  = samples_to_bytes(samples)
     lsb_bytes_out  = bytes(lsb_pool)
     hash_bytes_out = bytes(hash_pool)
 
-    print(f"\n{'─'*50}")
-    print(f"  OPTION A — LSB EXTRACTION")
-    print(f"    Total output bytes : {len(lsb_bytes_out):,}")
-    print(f"    Shannon entropy    : {shannon_entropy(lsb_bytes_out):.4f} bits/byte  (ideal=8.0)")
-    print(f"    Bit balance (1s)   : {bit_balance(lsb_bytes_out):.4f}              (ideal=0.5)")
+    # Per-grain stats
+    g_mean = float(np.mean(grain_entropies)) if grain_entropies else 0.0
+    g_std  = float(np.std(grain_entropies))  if grain_entropies else 0.0
 
-    print(f"\n  OPTION B — SHA-256 HASHED GRAINS")
-    print(f"    Total output bytes : {len(hash_bytes_out):,}")
-    print(f"    Shannon entropy    : {shannon_entropy(hash_bytes_out):.4f} bits/byte  (ideal=8.0)")
-    print(f"    Bit balance (1s)   : {bit_balance(hash_bytes_out):.4f}              (ideal=0.5)")
-    print(f"{'─'*50}")
+    print(f"\n{'─'*60}")
+    print(f"{'METRIC':<20} | {'RAW PCM':<10} | {'LSB EXT':<10} | {'HASHED':<10}")
+    print(f"{'─'*60}")
+    
+    def print_metric(name, raw, lsb, hashed, fmt=".4f"):
+        print(f"{name:<20} | {raw:{fmt}} | {lsb:{fmt}} | {hashed:{fmt}}")
+
+    print_metric("Shannon (bits/B)", 
+                 shannon_entropy(raw_bytes_out),
+                 shannon_entropy(lsb_bytes_out),
+                 shannon_entropy(hash_bytes_out))
+    
+    print_metric("Min-Entropy (bits/B)",
+                 min_entropy(raw_bytes_out),
+                 min_entropy(lsb_bytes_out),
+                 min_entropy(hash_bytes_out))
+
+    print_metric("Bit Balance (1s)",
+                 bit_balance(raw_bytes_out),
+                 bit_balance(lsb_bytes_out),
+                 bit_balance(hash_bytes_out))
+    
+    print(f"{'─'*60}")
+    print(f"Per-Grain Shannon Entropy (Raw):")
+    print(f"  Mean: {g_mean:.4f} bits/byte")
+    print(f"  StdDev: {g_std:.4f}")
+    print(f"{'─'*60}")
 
     # ── Save ─────────────────────────────────
     with open(output_file, "wb") as f:
