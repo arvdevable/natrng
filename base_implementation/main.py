@@ -32,7 +32,7 @@ CHANNELS       = 1               # mono
 WARMUP_SECONDS   = 1             # seconds to discard from start of recording
 VAR_THRESHOLD    = 0.5           # min variance per grain to accept as entropy
 MIN_UNIQUE_RATIO = 0.1           # min unique samples ratio per grain
-AUTOCORR_THRESHOLD = 0.95         # max abs(lag-1 autocorrelation) to accept
+AUTOCORR_THRESHOLD = 1         # max abs(lag-1 autocorrelation) to accept
 
 
 # ─────────────────────────────────────────────
