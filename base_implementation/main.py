@@ -15,7 +15,7 @@ import hashlib
 import os
 import struct
 import time
-from typing import Generator
+from typing import Generator, Optional
 
 import numpy as np
 
@@ -32,6 +32,7 @@ CHANNELS       = 1               # mono
 WARMUP_SECONDS   = 1             # seconds to discard from start of recording
 VAR_THRESHOLD    = 0.5           # min variance per grain to accept as entropy
 MIN_UNIQUE_RATIO = 0.1           # min unique samples ratio per grain
+AUTOCORR_THRESHOLD = 0.95         # max abs(lag-1 autocorrelation) to accept
 
 
 # ─────────────────────────────────────────────
@@ -129,21 +130,23 @@ def make_grains(samples: np.ndarray,
 # STEP 4A — OPTION A: LSB EXTRACTION
 # ─────────────────────────────────────────────
 
-def extract_lsb(grain: np.ndarray, n_bits: int = LSB_BITS) -> str:
+def extract_lsb(grain: np.ndarray, n_bits: int = LSB_BITS) -> bytes:
     """
     Extract the lowest `n_bits` bits from each sample in the grain.
-    Returns a bitstring of length  grain_size × n_bits.
-
-    Why LSBs?
-      High bits carry waveform structure (correlated, predictable).
-      Low bits carry thermal/quantisation noise (close to true randomness).
+    Returns bytes containing the concatenated LSBs. (Vectorized)
     """
-    mask   = (1 << n_bits) - 1          # e.g. n_bits=2  →  mask=0b11
-    bits   = []
-    for s in grain:
-        lsb = int(np.int16(s)) & mask
-        bits.append(f"{lsb:0{n_bits}b}")
-    return "".join(bits)
+    mask = (1 << n_bits) - 1
+    lsbs = grain.view(np.uint16) & mask
+    
+    # Pack into bytes. For performance, we skip the bitstring 
+    # and use bit-shifting if n_bits is small.
+    if n_bits == 1:
+        return np.packbits(lsbs.astype(np.uint8)).tobytes()
+    
+    # Fallback for n_bits=2 or others (still much faster than the old loop)
+    # as mostly vectorized except for the final pack
+    bit_parts = [f"{val:0{n_bits}b}" for val in lsbs]
+    return lsb_bits_to_bytes("".join(bit_parts))
 
 
 def lsb_bits_to_bytes(bitstring: str) -> bytes:
@@ -183,20 +186,17 @@ def hash_grain(grain: np.ndarray) -> bytes:
 def get_jitter_entropy(n_bytes: int = 16) -> bytes:
     """
     Measure CPU execution jitter.
-    Times a small busy-loop many times and collects high-precision 
-    timing deltas.
+    Collects high-precision timing deltas and whitens them via hashing.
     """
-    entropy = bytearray()
-    for _ in range(n_bytes):
-        # Time how long it takes to increment a counter 1000 times
-        t1 = time.perf_counter_ns()
-        x = 0
-        for i in range(1000):
-            x += i
-        t2 = time.perf_counter_ns()
-        # Take the LSB of the nanosecond delta
-        entropy.append((t2 - t1) & 0xFF)
-    return bytes(entropy)
+    deltas = bytearray()
+    prev = time.perf_counter_ns()
+    # Oversample to ensure enough entropy before hashing
+    for _ in range(n_bytes * 4):
+        cur = time.perf_counter_ns()
+        deltas.append((cur - prev) & 0xFF)
+        prev = cur
+    # Hash the raw deltas to condense and whiten
+    return hashlib.sha256(deltas).digest()[:n_bytes]
 
 
 def get_system_entropy() -> bytes:
@@ -207,6 +207,18 @@ def get_system_entropy() -> bytes:
         struct.pack("I", os.getpid()),
     ]
     return hashlib.sha256(b"".join(state)).digest()
+
+
+def autocorrelation_check(grain: np.ndarray, lag: int = 1) -> float:
+    """
+    Calculate lag-N autocorrelation. 
+    Ideally near 0.0 for white noise.
+    """
+    if len(grain) <= lag:
+        return 0.0
+    # Pearson correlation coefficient
+    corr = np.corrcoef(grain[:-lag], grain[lag:])[0, 1]
+    return float(corr) if not np.isnan(corr) else 1.0
 
 
 # ─────────────────────────────────────────────
@@ -251,7 +263,7 @@ def min_entropy(data: bytes) -> float:
 # ─────────────────────────────────────────────
 
 def run_pipeline(source: str = "mic",
-                 wav_path: str | None = None,
+                 wav_path: Optional[str] = None,
                  duration: int = DURATION,
                  grain_size: int = GRAIN_SIZE,
                  lsb_bits: int = LSB_BITS,
@@ -285,6 +297,7 @@ def run_pipeline(source: str = "mic",
     
     rejected_variance = 0
     rejected_unique   = 0
+    rejected_autocorr = 0
 
     print(f"\n[Step 3+4] Processing grains …")
     for grain in make_grains(samples, grain_size):
@@ -299,14 +312,19 @@ def run_pipeline(source: str = "mic",
         if unique_ratio < MIN_UNIQUE_RATIO:
             rejected_unique += 1
             continue
+            
+        # ── Health Test 3: Autocorrelation ─────
+        ac = autocorrelation_check(grain, lag=1)
+        if abs(ac) > AUTOCORR_THRESHOLD:
+            rejected_autocorr += 1
+            continue
 
         # Stats per grain (on raw PCM)
         g_bytes = grain.astype("<i2").tobytes()
         grain_entropies.append(shannon_entropy(g_bytes))
 
         # Entropy Sources
-        lsb_str   = extract_lsb(grain, lsb_bits)
-        lsb_bytes = lsb_bits_to_bytes(lsb_str)
+        lsb_bytes = extract_lsb(grain, lsb_bits)
         
         jitter_bytes = get_jitter_entropy(16)
         system_bytes = get_system_entropy()
@@ -329,7 +347,7 @@ def run_pipeline(source: str = "mic",
     g_std  = float(np.std(grain_entropies))  if grain_entropies else 0.0
 
     print(f"\n{'─'*60}")
-    print(f"Health Tests: {rejected_variance} low-variance grains rejected, {rejected_unique} low-uniqueness grains rejected.")
+    print(f"Health Tests: {rejected_variance} low-var, {rejected_unique} low-unique, {rejected_autocorr} high-autocorr grains rejected.")
     print(f"{'─'*60}")
     print(f"{'METRIC':<20} | {'RAW PCM':<10} | {'LSB EXT':<10} | {'MIXED/HASH':<10}")
     print(f"{'─'*60}")
