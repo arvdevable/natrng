@@ -9,6 +9,11 @@ Steps:
 
 Dependencies:
     pip install sounddevice numpy
+
+Todo:
+  1. Make the audio spectrum analyzer, use peaks, frequency, amplitude, etc. to determine the overall entropy of this concept.
+  2. Use loudness (as dB) to also determine the overall entropy of this concept.
+  3. Combine with jitter.
 """
 
 import hashlib
@@ -16,15 +21,17 @@ import os
 import struct
 import time
 from typing import Generator, Optional
-
+import matplotlib.pyplot as plt
 import numpy as np
+from datetime import date
+from pathlib import Path
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 SAMPLE_RATE    = 44_100          # Hz
 DURATION       = 10              # seconds  (10–30)
-GRAIN_SIZE     = 1024            # samples per grain  (try 2048 too)
+GRAIN_SIZE     = 2048            # samples per grain  (try 2048 too)
 LSB_BITS       = 2               # how many LSBs to extract per sample (1 or 2)
 CHANNELS       = 1               # mono
 
@@ -83,7 +90,6 @@ def load_wav(path: str) -> np.ndarray:
     print(f"[+] Loaded {len(samples):,} samples from '{path}'.")
     return samples
 
-
 # ─────────────────────────────────────────────
 # STEP 2 — CONVERT TO BINARY STREAM
 # ─────────────────────────────────────────────
@@ -108,6 +114,245 @@ def samples_to_bytes(samples: np.ndarray) -> bytes:
     """Pack int16 array to raw bytes (little-endian)."""
     return samples.astype("<i2").tobytes()
 
+def visualize_pipeline(samples: np.ndarray,
+                       lsb_bytes: bytes,
+                       hash_bytes: bytes,
+                       grain_size: int = GRAIN_SIZE,
+                       max_samples: int = 10000,
+                       mode: str = "panel",      # "panel" or "single"
+                       output_dir: str = ".",
+                       save_png: bool = True,
+                       include_extras: bool = True):
+    """
+    Visualize audio entropy pipeline.
+
+    modes:
+      - "panel": produce a single 2x2 figure containing:
+           1) Waveform with grain boundaries
+           2) LSB byte histogram
+           3) Hash byte histogram
+           4) Bit balance per hash block
+      - "single": produce separate figures, one image per panel, saved individually.
+
+    Extras (include_extras=True):
+      - Average loudness plot (RMS in dB) saved as a separate file
+      - Detailed info .txt with basic stats (num samples, rms, byte counts, mean/std)
+
+    Returns:
+      list of saved file paths (may be empty if save_png is False)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    saved_files = []
+
+    # sanitize inputs / slice samples
+    disp = np.asarray(samples[:max_samples])
+    # normalize if integer type to float range [-1, 1] for loudness calc
+    if np.issubdtype(disp.dtype, np.integer):
+        # try to infer bitdepth from dtype
+        info = np.iinfo(disp.dtype)
+        disp_float = disp.astype(np.float32) / max(abs(info.min), info.max)
+    else:
+        disp_float = disp.astype(np.float32)
+
+    # prepare arrays from bytes
+    lsb_arr = np.frombuffer(lsb_bytes or b"", dtype=np.uint8)
+    hash_arr = np.frombuffer(hash_bytes or b"", dtype=np.uint8)
+
+    # ---------- helpers to draw each panel ----------
+    def panel_waveform(ax):
+        ax.plot(disp, linewidth=0.6)
+        for i in range(0, len(disp), grain_size):
+            ax.axvline(x=i, color="red", linestyle="--", alpha=0.4, linewidth=0.8)
+        ax.set_title("Waveform with Grain Boundaries")
+        ax.set_xlabel("Sample Index")
+        ax.set_ylabel("Amplitude")
+
+    def panel_lsb_hist(ax):
+        if lsb_arr.size == 0:
+            ax.text(0.5, 0.5, "No LSB bytes", ha="center", va="center")
+            ax.set_axis_off()
+            return
+        ax.hist(lsb_arr, bins=64, edgecolor="none", density=True)
+        ax.axhline(1/256, color="red", linestyle="--", label="Ideal uniform")
+        ax.set_title("LSB Byte Distribution")
+        ax.set_xlabel("Byte Value")
+        ax.set_ylabel("Density")
+        ax.legend()
+
+    def panel_hash_hist(ax):
+        if hash_arr.size == 0:
+            ax.text(0.5, 0.5, "No hash bytes", ha="center", va="center")
+            ax.set_axis_off()
+            return
+        ax.hist(hash_arr, bins=64, edgecolor="none", density=True)
+        ax.axhline(1/256, color="red", linestyle="--", label="Ideal uniform")
+        ax.set_title("Hashed Output Byte Distribution")
+        ax.set_xlabel("Byte Value")
+        ax.set_ylabel("Density")
+        ax.legend()
+
+    def panel_bit_balance(ax):
+        if hash_arr.size == 0:
+            ax.text(0.5, 0.5, "No hash bytes", ha="center", va="center")
+            ax.set_axis_off()
+            return
+        # compute by 32-byte blocks; ignore trailing incomplete block
+        block_size = 32
+        n_blocks = len(hash_arr) // block_size
+        if n_blocks == 0:
+            ax.text(0.5, 0.5, "Not enough hash bytes for blocks", ha="center", va="center")
+            ax.set_axis_off()
+            return
+        grain_balances = []
+        for i in range(n_blocks):
+            chunk = hash_arr[i*block_size:(i+1)*block_size]
+            bits = np.unpackbits(chunk)
+            grain_balances.append(bits.mean())
+        grain_balances = np.array(grain_balances)
+        ax.plot(grain_balances, linewidth=0.8)
+        ax.axhline(0.5, color="red", linestyle="--", label="Ideal 0.50")
+        ax.set_ylim(0.3, 0.7)
+        ax.set_title("Bit Balance per Hash Block")
+        ax.set_xlabel("Block Index")
+        ax.set_ylabel("Fraction of 1-bits")
+        ax.legend()
+
+    # ---------- produce either panel or single images ----------
+    today_tag = date.today().isoformat()
+    # display format for user
+    display_date = date.today().strftime("%d/%m/%Y")
+
+    if mode == "panel":
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+        fig.suptitle(f"Audio Entropy Pipeline — Visual Analysis ({display_date})", fontsize=14)
+
+        panel_waveform(axes[0, 0])
+        panel_lsb_hist(axes[0, 1])
+        panel_hash_hist(axes[1, 0])
+        panel_bit_balance(axes[1, 1])
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        if save_png:
+            fname = os.path.join(output_dir, f"entrovis_panel_{today_tag}.png")
+            plt.savefig(fname, dpi=300)
+            saved_files.append(fname)
+            print(f"[+] Saved panel plot to '{fname}'")
+        plt.show()
+        plt.close(fig)
+
+    elif mode == "single":
+        # create one figure per panel
+        # Waveform
+        fig = plt.figure(figsize=(10, 4))
+        ax = fig.add_subplot(1, 1, 1)
+        panel_waveform(ax)
+        fig.suptitle(f"Analysis Date: {display_date}", fontsize=10, x=0.95, ha='right')
+        plt.tight_layout()
+        if save_png:
+            fname = os.path.join(output_dir, f"entrovis_waveform_{today_tag}.png")
+            plt.savefig(fname, dpi=300)
+            saved_files.append(fname)
+            print(f"[+] Saved waveform plot to '{fname}'")
+        plt.show()
+        plt.close(fig)
+
+        # LSB hist
+        fig = plt.figure(figsize=(8, 4))
+        ax = fig.add_subplot(1, 1, 1)
+        panel_lsb_hist(ax)
+        fig.suptitle(f"Analysis Date: {display_date}", fontsize=10, x=0.95, ha='right')
+        plt.tight_layout()
+        if save_png:
+            fname = os.path.join(output_dir, f"entrovis_lsb_hist_{today_tag}.png")
+            plt.savefig(fname, dpi=300)
+            saved_files.append(fname)
+            print(f"[+] Saved LSB histogram to '{fname}'")
+        plt.show()
+        plt.close(fig)
+
+        # Hash hist
+        fig = plt.figure(figsize=(8, 4))
+        ax = fig.add_subplot(1, 1, 1)
+        panel_hash_hist(ax)
+        fig.suptitle(f"Analysis Date: {display_date}", fontsize=10, x=0.95, ha='right')
+        plt.tight_layout()
+        if save_png:
+            fname = os.path.join(output_dir, f"entrovis_hash_hist_{today_tag}.png")
+            plt.savefig(fname, dpi=300)
+            saved_files.append(fname)
+            print(f"[+] Saved hash histogram to '{fname}'")
+        plt.show()
+        plt.close(fig)
+
+        # Bit balance
+        fig = plt.figure(figsize=(8, 4))
+        ax = fig.add_subplot(1, 1, 1)
+        panel_bit_balance(ax)
+        fig.suptitle(f"Analysis Date: {display_date}", fontsize=10, x=0.95, ha='right')
+        plt.tight_layout()
+        if save_png:
+            fname = os.path.join(output_dir, f"entrovis_bit_balance_{today_tag}.png")
+            plt.savefig(fname, dpi=300)
+            saved_files.append(fname)
+            print(f"[+] Saved bit balance plot to '{fname}'")
+        plt.show()
+        plt.close(fig)
+
+    else:
+        raise ValueError("mode must be 'panel' or 'single'")
+
+    # ---------- extras: avg loudness and detailed info ----------
+    if include_extras:
+        # RMS & dB calculation
+        eps = 1e-12
+        rms = np.sqrt(np.mean(disp_float**2)) if disp_float.size > 0 else 0.0
+        dbfs = 20 * np.log10(rms + eps)  # relative to full scale 1.0
+        # Average loudness plot (single point over time could be sliding window; keep simple RMS here)
+        fig = plt.figure(figsize=(8, 3))
+        ax = fig.add_subplot(1, 1, 1)
+        fig.suptitle(f"Analysis Date: {display_date}", fontsize=10, x=0.95, ha='right')
+        ax.plot([dbfs], marker='o')
+        ax.set_title("Average Loudness (RMS in dBFS)") # TODO: AVERAGE LOUDNESS PER SECOND IN DB
+        ax.set_ylabel("dBFS")
+        ax.set_xticks([])
+        plt.tight_layout()
+        if save_png:
+            fname = os.path.join(output_dir, f"entrovis_avg_loudness_{today_tag}.png")
+            plt.savefig(fname, dpi=300)
+            saved_files.append(fname)
+            print(f"[+] Saved avg loudness plot to '{fname}'")
+        plt.show()
+        plt.close(fig)
+
+        # detailed text info
+        info_lines = [
+            f"date: {today_tag}",
+            f"num_samples_shown: {len(disp)}",
+            f"grain_size: {grain_size}",
+            f"rms: {rms:.6g}",
+            f"dBFS: {dbfs:.3f}",
+            f"lsb_bytes_count: {lsb_arr.size}",
+            f"hash_bytes_count: {hash_arr.size}",
+            f"lsb_mean: {float(lsb_arr.mean()) if lsb_arr.size else 'N/A'}",
+            f"lsb_std: {float(lsb_arr.std()) if lsb_arr.size else 'N/A'}",
+            f"hash_mean: {float(hash_arr.mean()) if hash_arr.size else 'N/A'}",
+            f"hash_std: {float(hash_arr.std()) if hash_arr.size else 'N/A'}",
+        ]
+        txt_name = os.path.join(output_dir, f"entrovis_info_{today_tag}.txt")
+        with open(txt_name, "w", encoding="utf-8") as f:
+            f.write("\n".join(info_lines))
+        saved_files.append(txt_name)
+        print(f"[+] Saved detailed info to '{txt_name}'")
+
+    return saved_files
+
+
+# -------------------------
+# Example usage:
+# files = visualize_pipeline(my_samples, my_lsb_bytes, my_hash_bytes,
+#                            grain_size=1024, max_samples=20000,
+#                            mode="single", output_dir="results", include_extras=True)
+# print(files)
 
 # ─────────────────────────────────────────────
 # STEP 3 — GRAIN STRATEGY
@@ -376,8 +621,28 @@ def run_pipeline(source: str = "mic",
     print(f"  StdDev: {g_std:.4f}")
     print(f"{'─'*60}")
 
-    # ── Save ─────────────────────────────────
-    with open(output_file, "wb") as f:
+    # ── Output Directory ───────────────────
+    # include time to avoid overlaps as requested
+    ts_str = time.strftime("%Y-%m-%d_%H%M%S")
+    results_dir = os.path.join("results", f"entrovis_{ts_str}")
+    os.makedirs(results_dir, exist_ok=True)
+
+    # ── Visualization ──────────────────────
+    files = visualize_pipeline(samples, lsb_bytes_out, hash_bytes_out,
+                               grain_size=grain_size, max_samples=20000,
+                               mode="single", output_dir=results_dir, include_extras=True)
+    print(f"\n[+] Visualization files saved to '{results_dir}':")
+    for f_path in files:
+        print(f"  - {os.path.basename(f_path)}")
+
+    # ── Save Binary Entropy ────────────────
+    # If output_file is just a name, put it in the results_dir
+    if not os.path.dirname(output_file):
+        final_output_path = os.path.join(results_dir, output_file)
+    else:
+        final_output_path = output_file
+
+    with open(final_output_path, "wb") as f:
         # Write both pools sequentially with a simple 8-byte length prefix each
         lsb_len  = len(lsb_bytes_out).to_bytes(8, "big")
         hash_len = len(hash_bytes_out).to_bytes(8, "big")
@@ -388,7 +653,7 @@ def run_pipeline(source: str = "mic",
         f.write(hash_bytes_out)
 
     elapsed = time.perf_counter() - t0
-    print(f"\n[+] Saved entropy to '{output_file}'  ({elapsed:.2f}s total)")
+    print(f"\n[+] Saved entropy binary to '{final_output_path}'  ({elapsed:.2f}s total)")
 
 
 # ─────────────────────────────────────────────

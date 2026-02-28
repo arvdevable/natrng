@@ -1,0 +1,11 @@
+date: 2026-02-28
+num_samples_shown: 20000
+grain_size: 1024
+rms: 0.00309447
+dBFS: -50.188
+lsb_bytes_count: 105984
+hash_bytes_count: 13248
+lsb_mean: 127.60367602657004
+lsb_std: 74.07146639041216
+hash_mean: 126.74305555555556
+hash_std: 73.83870625320213

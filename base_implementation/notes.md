@@ -108,3 +108,40 @@ E:\web\natrng\base_implementation>
 ```
 
 autocorr threshold 0.95 -> 1
+
+===
+
+```
+E:\web\natrng\base_implementation>python main.py
+[*] Recording 10s (+1s warmup) @ 44100 Hz …
+[+] Captured 441,000 samples (discarded 44,100 warmup samples).
+
+[Step 2] Binary preview (first 4 samples):
+  sample 00: 1111111110011111
+  sample 01: 1111111110011111
+  sample 02: 1111111110100000
+  sample 03: 1111111110100001
+
+[Step 3+4] Processing grains …
+[*] Slicing into 430 grains × 1024 samples each.
+
+────────────────────────────────────────────────────────────
+Health Tests: 0 low-var, 0 low-unique, 0 high-autocorr grains rejected.
+────────────────────────────────────────────────────────────
+METRIC               | RAW PCM    | LSB EXT    | MIXED/HASH
+────────────────────────────────────────────────────────────
+Shannon (bits/B)     | 5.9309 | 7.9979 | 7.9873
+Min-Entropy (bits/B) | 2.3228 | 7.8293 | 7.5194
+Bit Balance (1s)     | 0.5010 | 0.5001 | 0.4999
+────────────────────────────────────────────────────────────
+Per-Grain Shannon Entropy (Raw):
+  Mean: 5.6358 bits/byte
+  StdDev: 0.4726
+────────────────────────────────────────────────────────────
+
+[+] Saved entropy to 'entropy_output.bin'  (12.03s total)
+
+E:\web\natrng\base_implementation>
+```
+
+mengubah sample rate grain menjadi 2048
