@@ -31,7 +31,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 SAMPLE_RATE    = 44_100          # Hz
 DURATION       = 10              # seconds  (10–30)
-GRAIN_SIZE     = 2048            # samples per grain  (try 2048 too)
+GRAIN_SIZE     = 2048            # samples per grain 
 LSB_BITS       = 2               # how many LSBs to extract per sample (1 or 2)
 CHANNELS       = 1               # mono
 
@@ -122,7 +122,8 @@ def visualize_pipeline(samples: np.ndarray,
                        mode: str = "panel",      # "panel" or "single"
                        output_dir: str = ".",
                        save_png: bool = True,
-                       include_extras: bool = True):
+                       include_extras: bool = True,
+                       show_plots: bool = False):
     """
     Visualize audio entropy pipeline.
 
@@ -237,7 +238,8 @@ def visualize_pipeline(samples: np.ndarray,
             plt.savefig(fname, dpi=300)
             saved_files.append(fname)
             print(f"[+] Saved panel plot to '{fname}'")
-        plt.show()
+        if show_plots:
+            plt.show()
         plt.close(fig)
 
     elif mode == "single":
@@ -706,7 +708,7 @@ if __name__ == "__main__":
     parser.add_argument("--source",     default="mic",   choices=["mic", "wav"])
     parser.add_argument("--wav",        default=None,    help="Path to WAV file (when --source=wav)")
     parser.add_argument("--duration",   default=10,      type=int,   help="Recording seconds (10–30)")
-    parser.add_argument("--grain",      default=1024,    type=int,   help="Samples per grain")
+    parser.add_argument("--grain",      default=GRAIN_SIZE,    type=int,   help="Samples per grain")
     parser.add_argument("--lsb-bits",   default=2,       type=int,   choices=[1, 2], help="LSBs per sample")
     parser.add_argument("--output",     default="entropy_output.bin")
     args = parser.parse_args()
