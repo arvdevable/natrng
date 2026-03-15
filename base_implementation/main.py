@@ -505,6 +505,81 @@ def min_entropy(data: bytes) -> float:
     return float(-np.log2(max_p))
 
 
+def avalanche_test(hash_func, trials=1000, input_size=256):
+    """
+    Measure avalanche effect for a hash function.
+    Returns average fraction of flipped output bits.
+    Ideal ≈ 0.5
+    """
+    import os
+    flips = []
+
+    for _ in range(trials):
+        data = bytearray(os.urandom(input_size))
+        h1 = hash_func(bytes(data))
+
+        # flip one random bit
+        byte_i = np.random.randint(len(data))
+        bit_i = np.random.randint(8)
+        data[byte_i] ^= (1 << bit_i)
+
+        h2 = hash_func(bytes(data))
+
+        b1 = np.unpackbits(np.frombuffer(h1, dtype=np.uint8))
+        b2 = np.unpackbits(np.frombuffer(h2, dtype=np.uint8))
+
+        flips.append(np.mean(b1 != b2))
+
+    return float(np.mean(flips))
+
+
+def serial_correlation(data: bytes) -> float:
+    """Detect if byte n correlates with byte n+1. Ideal ≈ 0.0."""
+    arr = np.frombuffer(data, dtype=np.uint8).astype(np.float64)
+    if len(arr) < 2:
+        return 0.0
+    x = arr[:-1]
+    y = arr[1:]
+    corr = np.corrcoef(x, y)[0, 1]
+    return float(corr) if not np.isnan(corr) else 0.0
+
+
+def monobit_test(data: bytes) -> float:
+    """Calculate ratio of ones. Ideal ≈ 0.5."""
+    if not data:
+        return 0.0
+    bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
+    return float(np.sum(bits) / len(bits))
+
+
+def runs_test(data: bytes) -> float:
+    """Detect streaks of 1s or 0s. Ideal ≈ 0.5."""
+    if not data:
+        return 0.0
+    bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
+    if len(bits) == 0:
+        return 0.0
+    
+    runs = 1
+    for i in range(1, len(bits)):
+        if bits[i] != bits[i-1]:
+            runs += 1
+    return float(runs / len(bits))
+
+
+def rng_health_report(data: bytes):
+    """Print a comprehensive RNG health report."""
+    print("\n[Health Report] Statistical Quality Metrics")
+    print("-" * 45)
+    print(f"{'Shannon Entropy:':<25} {shannon_entropy(data):.6f} (Ideal: 8.0)")
+    print(f"{'Min Entropy:':<25} {min_entropy(data):.6f} (Ideal: 8.0)")
+    print(f"{'Bit Balance:':<25} {bit_balance(data):.6f} (Ideal: 0.5)")
+    print(f"{'Serial Correlation:':<25} {serial_correlation(data):.6f} (Ideal: 0.0)")
+    print(f"{'Monobit Ratio:':<25} {monobit_test(data):.6f} (Ideal: 0.5)")
+    print(f"{'Runs Test Score:':<25} {runs_test(data):.6f} (Ideal: 0.5)")
+    print("-" * 45)
+
+
 # ─────────────────────────────────────────────
 # PIPELINE RUNNER
 # ─────────────────────────────────────────────
@@ -622,6 +697,16 @@ def run_pipeline(source: str = "mic",
     print(f"  Mean: {g_mean:.4f} bits/byte")
     print(f"  StdDev: {g_std:.4f}")
     print(f"{'─'*60}")
+
+    # ── Avalanche Test ──────────────────────
+    print("\n[*] Running Avalanche Test (SHA-256) ...")
+    av_score = avalanche_test(lambda x: hashlib.sha256(x).digest())
+    print(f"Avalanche score: {av_score:.4f} (Expected: 0.49 - 0.51)")
+    if av_score < 0.40:
+        print("[!] WARNING: Hash function shows poor avalanche effect.")
+
+    # ── Final Health Report ──────────────────
+    rng_health_report(hash_bytes_out)
 
     # ── Output Directory ───────────────────
     # include time to avoid overlaps as requested
